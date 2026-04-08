@@ -1,0 +1,78 @@
+---
+- name: Instalar check de atualizacao automatizada via NRPE
+  hosts: all
+  become: true
+
+  tasks:
+
+    - name: Criar diretorio ansible se nao existir
+      ansible.builtin.file:
+        path: /usr/local/nagios/libexec/ansible
+        state: directory
+        mode: '0755'
+
+    - name: Copiar script do plugin
+      ansible.builtin.copy:
+        dest: /usr/local/nagios/libexec/ansible/check_atualizacao_automatizada.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          ###############################################
+          # check_atualizacao_automatizada.sh
+          #
+          # Plugin Nagios para monitorar o status da
+          # atualizacao automatizada via Ansible.
+          #
+          # Le /var/tmp/patch_update_status escrito
+          # pelo playbook de atualizacao.
+          #
+          # Formato: CODIGO|MENSAGEM
+          #   0 = OK, 1 = WARNING, 2 = CRITICAL
+          #
+          # Se o ficheiro nao existir = OK.
+          ###############################################
+
+          STATUS_FILE="/var/tmp/patch_update_status"
+
+          if [ ! -f "$STATUS_FILE" ]; then
+              echo "OK: Nenhuma atualizacao pendente"
+              exit 0
+          fi
+
+          CODIGO=$(cut -d"|" -f1 "$STATUS_FILE")
+          MENSAGEM=$(cut -d"|" -f2- "$STATUS_FILE")
+
+          if [[ ! "$CODIGO" =~ ^[0-2]$ ]]; then
+              echo "UNKNOWN: Formato invalido no ficheiro de status"
+              exit 3
+          fi
+
+          echo "$MENSAGEM"
+          exit "$CODIGO"
+
+    - name: Verificar se comando ja existe no common.cfg
+      ansible.builtin.command: grep -q "check_atualizacao_automatizada" /usr/local/nagios/etc/nrpe/common.cfg
+      register: ja_existe
+      changed_when: false
+      failed_when: false
+
+    - name: Adicionar pular linha, comentario e comando no common.cfg
+      ansible.builtin.shell: |
+        echo "" >> /usr/local/nagios/etc/nrpe/common.cfg
+        echo "### Checar atualizacoes automatizadas ###" >> /usr/local/nagios/etc/nrpe/common.cfg
+        echo "command[check_atualizacao_automatizada]=/usr/local/nagios/libexec/ansible/check_atualizacao_automatizada.sh" >> /usr/local/nagios/etc/nrpe/common.cfg
+      when: ja_existe.rc != 0
+
+    - name: Reiniciar NRPE
+      ansible.builtin.service:
+        name: "{{ 'nagios-nrpe-server' if ansible_os_family == 'Debian' else 'nrpe' }}"
+        state: restarted
+
+    - name: Testar plugin
+      ansible.builtin.command: /usr/local/nagios/libexec/ansible/check_atualizacao_automatizada.sh
+      register: teste
+      changed_when: false
+
+    - name: Resultado do teste
+      ansible.builtin.debug:
+        msg: "{{ teste.stdout }}"

@@ -1,0 +1,400 @@
+###################################################################
+#
+#  PLAYBOOK: Atualizacao de servidores Linux
+#
+#  OBJETIVO:
+#    Atualizar pacotes via apt-get upgrade, preservando
+#    configuracoes existentes (--force-confold/confdef).
+#    Monitorar servicos criticos e garantir que servicos
+#    que estavam ativos ANTES continuem ativos DEPOIS.
+#
+#  EXECUCAO (via Rundeck no VERSAILLES):
+#    ansible-playbook playbook.yml --limit pool_1
+#
+#  LOGICA DOS SERVICOS CRITICOS:
+#    - Lista global definida em vars
+#    - Descobre automaticamente quais existem em cada servidor
+#    - Se NAO EXISTE → ignora silenciosamente
+#    - Se EXISTE e estava PARADO antes → mantem parado
+#    - Se EXISTE e estava ATIVO antes → garante que suba
+#    - Se nao subir apos restart → playbook FALHA
+#
+#  NAGIOS (NRPE):
+#    - Escreve ficheiro /var/tmp/patch_update_status em cada servidor
+#    - Formato: CODIGO|MENSAGEM (0=OK, 1=WARNING, 2=CRITICAL)
+#    - Nagios XI le esse ficheiro via NRPE (check_atualizacao_automatizada)
+#    - Tasks de status estao distribuidas nos momentos corretos:
+#        Etapa 3 (antes do upgrade)  → "atualizando"
+#        Etapa 4 (antes do reboot)   → "reiniciando"
+#        Etapa 8 (resultado final)   → "OK" ou "CRITICAL"
+#
+#  NOTAS:
+#    - apt-get upgrade NUNCA muda versao major (ex: Java 8→11)
+#    - Variaveis register morrem no reboot, mas set_fact sobrevive
+#    - Snapshot salvo em arquivo antes do reboot como backup
+#
+###################################################################
+
+---
+- name: Atualizacao de servidores Linux preservando configuracoes
+  hosts: all
+  become: true
+
+  vars:
+    arquivo_servicos_antes: "/tmp/servicos_antes.log"
+    arquivo_servicos_depois: "/tmp/servicos_depois.log"
+    apt_tmpdir: "/var/cache/apt/archives"
+
+    #--------------------------------------------------------------
+    # LISTA GLOBAL DE SERVICOS CRITICOS
+    #--------------------------------------------------------------
+    servicos_criticos:
+      - ssh.service
+      - cron.service
+      - rsyslog.service
+      - winbind.service
+      - snmpd.service
+      - postfix@-.service
+      - nagios-nrpe-server.service
+      - social-treinamento.service
+      - social-validacao.service
+
+  tasks:
+
+    - name: Registrar inicio da execucao
+      ansible.builtin.debug:
+        msg: "=== Inicio: {{ ansible_date_time.date }} as {{ ansible_date_time.time }} - {{ inventory_hostname }} ==="
+
+    ###################################################################
+    # ETAPA 1: DESCOBERTA
+    ###################################################################
+
+    - name: Verificar quais servicos criticos existem neste servidor
+      ansible.builtin.command: "systemctl cat {{ item }}"
+      loop: "{{ servicos_criticos }}"
+      register: criticos_existem_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Filtrar apenas servicos que existem
+      ansible.builtin.set_fact:
+        servicos_criticos_local: >-
+          {{
+            criticos_existem_raw.results
+            | selectattr('rc', 'equalto', 0)
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: Exibir servicos criticos encontrados neste servidor
+      ansible.builtin.debug:
+        msg: "Servicos criticos neste servidor ({{ servicos_criticos_local | length }}): {{ servicos_criticos_local }}"
+
+    ###################################################################
+    # ETAPA 2: SNAPSHOT ANTES - SERVICOS CRITICOS
+    ###################################################################
+
+    - name: Coletar estado dos servicos criticos antes
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop: "{{ servicos_criticos_local }}"
+      register: criticos_antes_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Montar mapa de servicos criticos antes
+      ansible.builtin.set_fact:
+        criticos_antes: >-
+          {{
+            criticos_antes | default({}) | combine({
+              item.item: item.stdout | default('unknown')
+            })
+          }}
+      loop: "{{ criticos_antes_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Exibir estado dos servicos criticos antes
+      ansible.builtin.debug:
+        msg: "{{ item.key }}: {{ item.value }}"
+      loop: "{{ criticos_antes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    ###################################################################
+    # ETAPA 2: SNAPSHOT ANTES - TODOS OS SERVICOS
+    ###################################################################
+
+    - name: Coletar servicos ativos antes da atualizacao (completo)
+      ansible.builtin.command: systemctl list-units --type=service --state=running
+      register: servicos_antes_full
+      changed_when: false
+
+    - name: Exibir servicos antes da atualizacao (completo)
+      ansible.builtin.debug:
+        msg: "{{ servicos_antes_full.stdout_lines }}"
+
+    - name: Salvar servicos antes da atualizacao em arquivo
+      ansible.builtin.copy:
+        content: "{{ servicos_antes_full.stdout_lines | join('\n') }}"
+        dest: "{{ arquivo_servicos_antes }}"
+        force: yes
+
+    - name: Coletar lista limpa de servicos antes
+      ansible.builtin.shell: >
+        systemctl list-units
+        --type=service
+        --state=running
+        --no-legend
+        --no-pager
+        | awk '{print $1}'
+      register: servicos_antes_lista
+      changed_when: false
+
+    - name: Definir lista de servicos antes
+      ansible.builtin.set_fact:
+        lista_servicos_antes: "{{ servicos_antes_lista.stdout_lines }}"
+
+    ###################################################################
+    # ETAPA 3: ATUALIZACAO
+    ###################################################################
+
+    - name: Status Nagios - atualizando
+      ansible.builtin.copy:
+        content: "1|Atualizacao em andamento - Inicio: {{ ansible_date_time.date }} as {{ ansible_date_time.time }}"
+        dest: /var/tmp/patch_update_status
+        mode: '0644'
+        force: yes
+
+    - name: Atualizar cache do apt
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Garantir apt-utils instalado
+      ansible.builtin.apt:
+        name: apt-utils
+        state: present
+
+    - name: Atualizar pacotes preservando configuracoes
+      ansible.builtin.shell: |
+        apt-get -y upgrade \
+          -o Dpkg::Options::=--force-confold \
+          -o Dpkg::Options::=--force-confdef
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        TMPDIR: "{{ apt_tmpdir }}"
+
+    ###################################################################
+    # ETAPA 4: REBOOT (SE NECESSARIO)
+    ###################################################################
+
+    - name: Verificar se reboot e necessario
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Status Nagios - reiniciando
+      ansible.builtin.copy:
+        content: "1|Servidor reiniciando apos atualizacao - {{ ansible_date_time.date }} as {{ ansible_date_time.time }}"
+        dest: /var/tmp/patch_update_status
+        mode: '0644'
+        force: yes
+      when: reboot_required.stat.exists
+
+    - name: Reboot se necessario
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when: reboot_required.stat.exists
+
+    ###################################################################
+    # ETAPA 5: SNAPSHOT DEPOIS
+    ###################################################################
+
+    - name: Coletar servicos ativos depois da atualizacao (completo)
+      ansible.builtin.command: systemctl list-units --type=service --state=running
+      register: servicos_depois_full
+      changed_when: false
+
+    - name: Exibir servicos depois da atualizacao (completo)
+      ansible.builtin.debug:
+        msg: "{{ servicos_depois_full.stdout_lines }}"
+
+    - name: Salvar servicos depois da atualizacao em arquivo
+      ansible.builtin.copy:
+        content: "{{ servicos_depois_full.stdout_lines | join('\n') }}"
+        dest: "{{ arquivo_servicos_depois }}"
+        force: yes
+
+    - name: Coletar lista limpa de servicos depois
+      ansible.builtin.shell: >
+        systemctl list-units
+        --type=service
+        --state=running
+        --no-legend
+        --no-pager
+        | awk '{print $1}'
+      register: servicos_depois_lista
+      changed_when: false
+
+    - name: Definir lista de servicos depois
+      ansible.builtin.set_fact:
+        lista_servicos_depois: "{{ servicos_depois_lista.stdout_lines }}"
+
+    ###################################################################
+    # ETAPA 6: RECUPERACAO GERAL
+    ###################################################################
+
+    - name: Identificar servicos que cairam
+      ansible.builtin.set_fact:
+        servicos_caidos: "{{ lista_servicos_antes | difference(lista_servicos_depois) }}"
+
+    - name: Mostrar servicos que cairam
+      ansible.builtin.debug:
+        msg: "Servicos que cairam: {{ servicos_caidos }}"
+      when: servicos_caidos | length > 0
+
+    - name: Reiniciar servicos que cairam
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ servicos_caidos }}"
+      when:
+        - servicos_caidos | length > 0
+        - item is match("^[A-Za-z0-9_.@-]+\\.service$")
+
+    ###################################################################
+    # ETAPA 7: VALIDACAO DOS SERVICOS CRITICOS
+    ###################################################################
+
+    - name: Coletar estado dos servicos criticos depois
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop: "{{ servicos_criticos_local }}"
+      register: criticos_depois_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Montar mapa de servicos criticos depois
+      ansible.builtin.set_fact:
+        criticos_depois: >-
+          {{
+            criticos_depois | default({}) | combine({
+              item.item: item.stdout | default('unknown')
+            })
+          }}
+      loop: "{{ criticos_depois_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Identificar servicos criticos que precisam subir
+      ansible.builtin.set_fact:
+        criticos_para_subir: >-
+          {{
+            criticos_antes | dict2items
+            | selectattr('value', 'equalto', 'active')
+            | map(attribute='key')
+            | select('in',
+                criticos_depois | dict2items
+                | rejectattr('value', 'equalto', 'active')
+                | map(attribute='key') | list
+              )
+            | list
+          }}
+
+    - name: Reiniciar servicos criticos que estavam ativos e cairam
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ criticos_para_subir }}"
+      when: criticos_para_subir | length > 0
+
+    - name: Verificar estado final dos servicos criticos
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop: "{{ servicos_criticos_local }}"
+      register: criticos_final_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Montar mapa final dos servicos criticos
+      ansible.builtin.set_fact:
+        criticos_final: >-
+          {{
+            criticos_final | default({}) | combine({
+              item.item: item.stdout | default('unknown')
+            })
+          }}
+      loop: "{{ criticos_final_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    ###################################################################
+    # ETAPA 8: RELATORIO + NAGIOS
+    ###################################################################
+
+    - name: Identificar servicos criticos que falharam
+      ansible.builtin.set_fact:
+        criticos_falharam: >-
+          {{
+            criticos_antes | dict2items
+            | selectattr('value', 'equalto', 'active')
+            | map(attribute='key')
+            | select('in',
+                criticos_final | dict2items
+                | rejectattr('value', 'equalto', 'active')
+                | map(attribute='key') | list
+              )
+            | list
+          }}
+
+    - name: Exibir relatorio de servicos criticos
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+           RELATORIO - {{ inventory_hostname }}
+           Data: {{ ansible_date_time.date }} as {{ ansible_date_time.time }}
+           Reboot necessario: {{ 'Sim' if reboot_required.stat.exists else 'Nao' }}
+           Servicos antes: {{ lista_servicos_antes | length }}
+           Servicos depois: {{ lista_servicos_depois | length }}
+          ═══════════════════════════════════════════════════════════
+           SERVICOS CRITICOS ({{ servicos_criticos_local | length }}):
+          {% for svc in servicos_criticos_local %}
+          {% if criticos_antes[svc] == 'active' and criticos_final[svc] == 'active' and svc not in criticos_para_subir %}
+             [OK] {{ svc }} — ativo antes, ativo depois
+          {% elif criticos_antes[svc] == 'active' and criticos_final[svc] == 'active' and svc in criticos_para_subir %}
+             [WARN] {{ svc }} — caiu, foi RECUPERADO
+          {% elif criticos_antes[svc] == 'active' and criticos_final[svc] != 'active' %}
+             [FAIL] {{ svc }} — estava ativo, NAO SUBIU!
+          {% elif criticos_antes[svc] != 'active' and criticos_final[svc] != 'active' %}
+             [PAUSE] {{ svc }} — parado antes, mantido parado
+          {% elif criticos_antes[svc] != 'active' and criticos_final[svc] == 'active' %}
+             [INFO] {{ svc }} — estava parado, subiu sozinho
+          {% endif %}
+          {% endfor %}
+          ═══════════════════════════════════════════════════════════
+          {% if criticos_falharam | length > 0 %}
+           [FALHA] {{ criticos_falharam | length }} servico(s) FALHARAM:
+              {{ criticos_falharam | join(', ') }}
+          {% else %}
+           [OK] Todos os servicos criticos conforme esperado.
+          {% endif %}
+          ═══════════════════════════════════════════════════════════
+
+    - name: Status Nagios - resultado final
+      ansible.builtin.copy:
+        content: >-
+          {{ '2|CRITICAL: Servicos nao subiram: ' + criticos_falharam | join(', ')
+             if criticos_falharam | length > 0
+             else '0|OK: Atualizacao concluida. Servicos OK. Reboot necessario: ' + ('Sim' if reboot_required.stat.exists else 'Nao') + ' - ' + ansible_date_time.date + ' as ' + ansible_date_time.time }}
+        dest: /var/tmp/patch_update_status
+        mode: '0644'
+        force: yes
+
+    ###################################################################
+    # ETAPA 9: DECISAO FINAL
+    ###################################################################
+
+    - name: Falhar se servico critico nao subiu
+      ansible.builtin.assert:
+        that:
+          - criticos_falharam | length == 0
+        fail_msg: "[FALHA] Servicos criticos que nao subiram: {{ criticos_falharam | join(', ') }}"
+        success_msg: "[OK] Atualizacao concluida com sucesso. Todos os servicos criticos OK."
