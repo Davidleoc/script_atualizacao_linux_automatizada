@@ -1,0 +1,6 @@
+.env
+*.log
+*.retry
+*.tmp
+servicos_antes.log
+servicos_depois.log
