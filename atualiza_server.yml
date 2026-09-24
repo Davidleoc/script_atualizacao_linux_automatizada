@@ -8,8 +8,8 @@
 #    Monitorar servicos criticos e garantir que servicos
 #    que estavam ativos ANTES continuem ativos DEPOIS.
 #
-#  EXECUCAO (via Rundeck no VERSAILLES):
-#    ansible-playbook playbook.yml --limit pool_1
+#  EXECUCAO (via Rundeck ):
+#    ansible-playbook playbook.yml
 #
 #  LOGICA DOS SERVICOS CRITICOS:
 #    - Lista global definida em vars
