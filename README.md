@@ -22,9 +22,9 @@ A solução resolve o problema de janelas de manutenção manuais que podem leva
 
 ## 📋 Pré-requisitos
 
-1. **Ansible** instalado no servidor Controller (ex: VERSAILLES).
+1. **Ansible** instalado no servidor Controller, onde roda o Ansible/Rundeck.
 2. **NRPE** configurado nos servidores de destino.
-3. Acesso SSH via chave privada para o usuário de gestão (ex: `srvlinuxmgmt`).
+3. Acesso SSH via chave privada para o usuário de gestão.
 
 ## 🔧 Configuração e Uso
 
